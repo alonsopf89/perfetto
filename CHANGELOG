@@ -31,6 +31,9 @@ Unreleased:
       visualizing Android framework process states and freezer state per
       process and per state, with residency and transition breakdowns for area
       selections.
+    * Added the ability (only enabled for internal users during initial soak
+      period) to open traces from Google Drive via a new "Open from GDrive"
+      sidebar button.
   SDK:
     * Android Java SDK: events started while another event is being built on
       the same thread are no longer dropped.

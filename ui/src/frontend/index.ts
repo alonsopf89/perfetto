@@ -159,6 +159,17 @@ function setupContentSecurityPolicy() {
       // and SQL formatter) without enabling JavaScript eval().
       `'wasm-unsafe-eval'`,
       'https://www.googletagmanager.com',
+      // The Google Drive plugin's scripts. Each entry names the one script, or
+      // script directory, that is needed, rather than its whole host: those
+      // hosts also serve callback-style endpoints, which would weaken this
+      // policy if allowed.
+      // - Google Identity Services, for signing in.
+      'https://accounts.google.com/gsi/client',
+      // - The Google API loader.
+      'https://apis.google.com/js/api.js',
+      // - The modules that loader fetches, such as the file picker. Their URLs
+      //   contain version hashes, so only the directory can be named.
+      'https://apis.google.com/_/scs/abc-static/_/js/',
     ],
     'object-src': [`'none'`],
     'connect-src': [
@@ -176,8 +187,16 @@ function setupContentSecurityPolicy() {
       'https://*.google-analytics.com',
       'https://www.googletagmanager.com',
       'https://*.googleapis.com',
+      // Static assets/icons for Google Picker and Identity Services.
+      'https://ssl.gstatic.com',
     ],
     'style-src': [`'self'`, `'unsafe-inline'`],
+    'frame-src': [
+      // Google Identity Services OAuth2 iframes (gsi/iframe/select, o/oauth2/iframe).
+      'https://accounts.google.com/',
+      // Google Drive Picker dialog iframe.
+      'https://docs.google.com',
+    ],
   };
   const meta = document.createElement('meta');
   meta.httpEquiv = 'Content-Security-Policy';
