@@ -30,9 +30,9 @@ Button visibility:
 
 Failure modes:
 
-- [ ] [Popup blocked](#popup-blocked-sign-in-to-google-drive-dialog)
-- [ ] [Sign-in failure](#sign-in-failure-couldnt-sign-in-to-google-drive-dialog)
-- [ ] [Sign-in popup closed](#sign-in-popup-closed)
+- [ ] [Popup blocked](#popup-blocked-connect-to-google-drive-dialog)
+- [ ] [Connection failure](#connection-failure-couldnt-connect-to-google-drive-dialog)
+- [ ] [Google popup closed](#google-popup-closed)
 - [ ] [File not yet authorised](#file-not-yet-authorised-authorize-access-to-file-dialog)
 - [ ] [Initialisation fails, with a deep link](#initialisation-fails)
 - [ ] [Invalid deep link payload](#invalid-deep-link-payload)
@@ -90,9 +90,9 @@ from a Drive link (`https://drive.google.com/file/d/<FILE_ID>/view`).
 
 Expected:
 
-1. Unless popups are allowed for the site, the "Sign in to Google Drive"
+1. Unless popups are allowed for the site, the "Connect to Google Drive"
    dialog appears first, see
-   [Popup blocked](#popup-blocked-sign-in-to-google-drive-dialog).
+   [Popup blocked](#popup-blocked-connect-to-google-drive-dialog).
 2. After signing in, the trace loads, titled with the file's real name. The
    deep link only carries the file ID, so the name is looked up from Drive
    with a separate metadata request alongside the download.
@@ -167,8 +167,8 @@ To test:
 3. **Non-internal user with the flag:** still as a non-internal user, open the
    flags page (`#!/flags`), enable "Google Drive for external users" and
    reload. The button should now appear, and the sidebar flow should work with
-   a non-corp Google account. Unlike the mock flags, this flag is listed on
-   every deployment, not just localhost. Turn it off afterwards.
+   a non-corp Google account. The flag is listed on every deployment, not
+   just localhost. Turn it off afterwards.
 
 ### Initialisation fails
 
@@ -215,38 +215,40 @@ This is a regular plugin, enabled by default, so it can be turned off.
 4. Loading a deep link URL should do nothing.
 5. Re-enable the plugin afterwards.
 
-### Popup blocked ("Sign in to Google Drive" dialog)
+### Popup blocked ("Connect to Google Drive" dialog)
 
 1. Make sure popups are not set to "Allow" for `localhost:10000`
    (`chrome://settings/content/popups`).
 2. Load the deep link URL and do not click anything while it loads.
-3. The "Sign in to Google Drive" dialog should appear, including a hint that
+3. The "Connect to Google Drive" dialog should appear, including a hint that
    allowing pop-ups for the site skips this step.
-4. Click "Sign in". The Google popup should open, and after signing in the
+4. Click "Connect". The Google popup should open, and after signing in the
    trace should load without a page reload.
 5. Repeat and click "Cancel" instead. The dialog should close and nothing else
    should happen.
 6. Set popups to "Allow" for `localhost:10000` and load the deep link again.
    The dialog should not appear; the Google popup should open by itself.
 
-### Sign-in failure ("Couldn't sign in to Google Drive" dialog)
+### Connection failure ("Couldn't connect to Google Drive" dialog)
 
-1. Open `http://localhost:10000/#!/flags` and enable
-   "Development: Google Drive mock sign-in failure". The flag is only listed
-   on localhost.
+This is shown when Google reports an error while connecting, for example
+because the user refuses to grant access.
+
+1. Use a Google account that has not yet granted Perfetto access to Drive (or
+   remove Perfetto's access from the account's third-party access page first).
 2. Click "Open from GDrive", or load the deep link URL.
-3. The "Couldn't sign in to Google Drive" dialog should appear with the mock
-   error message, rather than the generic crash dialog.
-4. "Try again" should show the same dialog again while the flag is on.
-   "Cancel" should dismiss it.
-5. Turn the flag off afterwards.
+3. On Google's consent screen, press "Cancel" rather than granting access.
+4. The "Couldn't connect to Google Drive" dialog should appear with Google's
+   error, rather than the generic crash dialog.
+5. "Try again" should reopen the Google popup. "Cancel" should dismiss the
+   dialog.
 
-### Sign-in popup closed
+### Google popup closed
 
 1. Set popups to "Allow" for `localhost:10000`, or start from the sidebar
    button.
 2. When the Google popup opens, close it without signing in.
-3. The "Couldn't sign in to Google Drive" dialog should appear, saying the
+3. The "Couldn't connect to Google Drive" dialog should appear, saying the
    window was closed.
 4. "Try again" should reopen the popup. From the sidebar, signing in should
    then open the picker; from a deep link, it should load the trace.
@@ -280,10 +282,8 @@ Each of these should be ignored silently: no dialog, no sign-in, and the
 
 ### Download failures
 
-To make every download fail, open `http://localhost:10000/#!/flags` and enable
-"Development: Google Drive mock download failure". Sign-in and the picker
-still work normally; only the download itself fails. The flag is only listed
-on localhost. Turn it off afterwards.
+To make a download fail, set DevTools Network throttling to "Offline" once
+connected, just before the download starts.
 
 A failed download shows a "Couldn't open file from Google Drive" dialog with
 an "OK" button and no retry. The underlying error is logged to the console.
@@ -291,19 +291,17 @@ an "OK" button and no retry. The underlying error is logged to the console.
 The one exception is when Drive refuses access to the file (HTTP 403 or 404)
 on a deep link: that shows the "Authorize access to file" dialog instead, see
 [File not yet authorised](#file-not-yet-authorised-authorize-access-to-file-dialog).
-The mock flag does not count as an access refusal.
 
-- **Sidebar flow** (mock flag on, then pick a file): the failure dialog should
-  appear.
-- **Deep link** (mock flag on, or go offline after signing in): the failure
-  dialog should appear, not the "Authorize access to file" dialog.
+- **Sidebar flow** (go offline once the picker is showing, then pick a file):
+  the failure dialog should appear.
+- **Deep link** (go offline after connecting, e.g. while the "Connect to Google
+  Drive" dialog is showing, then press "Connect"): the failure dialog should
+  appear, not the "Authorize access to file" dialog.
 - **Deep link, the download after authorising fails** (load a deep link for a
   file not yet authorised, click "Authorize File Access", and once the picker
   is showing set DevTools Network throttling to "Offline" before picking the
   file): the "Authorize access to file" dialog should close and the failure
-  dialog should appear. The mock flag is no help here: turned on beforehand, it
-  stops the "Authorize access to file" dialog from appearing in the first
-  place.
+  dialog should appear.
 
 ### Picker failures
 

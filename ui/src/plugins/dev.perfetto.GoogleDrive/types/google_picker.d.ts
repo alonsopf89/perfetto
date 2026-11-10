@@ -12,36 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Minimal ambient types for the Google APIs loaded dynamically at runtime
-// (gapi, Google Picker, Drive API v3, Drive Share dialog, and Google Identity
-// Services). Keeping these local avoids pulling in third-party @types packages
-// (e.g. @types/gapi.client.drive-v3 and its transitive dependencies).
+// Minimal ambient types for google.picker, the Google Picker API, which the
+// Google API loader's 'picker' module adds at runtime. Only the parts this
+// plugin uses are declared.
+//
+// These are declared here rather than taken from @types/google.picker to keep
+// them to what the plugin calls.
 
 declare global {
-  namespace gapi {
-    function load(
-      apiName: string,
-      callbackOrConfig:
-        | (() => void)
-        | {
-            callback: () => void;
-            onerror?: () => void;
-            timeout?: number;
-            ontimeout?: () => void;
-          },
-    ): void;
-
-    namespace drive {
-      namespace share {
-        class ShareClient {
-          setOAuthToken(token: string): void;
-          setItemIds(ids: string[]): void;
-          showSettingsDialog(): void;
-        }
-      }
-    }
-  }
-
   namespace google.picker {
     interface DocumentObject {
       readonly id: string;
@@ -91,41 +69,6 @@ declare global {
       setCallback(callback: (data: ResponseObject) => void): this;
       build(): Picker;
     }
-  }
-
-  // The GSI OAuth2 token client returned by google.accounts.oauth2
-  // .initTokenClient().
-  interface GDriveTokenClient {
-    requestAccessToken(options?: {prompt?: string}): void;
-  }
-
-  interface GDriveTokenResponse {
-    readonly error?: string;
-    readonly access_token?: string;
-    readonly expires_in?: string;
-    readonly token_type?: string;
-    readonly scope?: string;
-  }
-
-  interface GDriveTokenClientError {
-    readonly type?: string;
-  }
-
-  // The GSI scripts attach everything to window.google. We type the oauth2
-  // token client here via a Window augmentation.
-  interface Window {
-    google?: {
-      accounts?: {
-        oauth2?: {
-          initTokenClient(params: {
-            client_id: string;
-            scope: string;
-            callback?: (response: GDriveTokenResponse) => void;
-            error_callback?: (error: GDriveTokenClientError) => void;
-          }): GDriveTokenClient;
-        };
-      };
-    };
   }
 }
 
