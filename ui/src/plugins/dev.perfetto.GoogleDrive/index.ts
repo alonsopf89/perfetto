@@ -17,6 +17,8 @@ import {z} from 'zod';
 import type {App} from '../../public/app';
 import type {Flag} from '../../public/feature_flag';
 import type {PerfettoPlugin} from '../../public/plugin';
+import type {RouteArgs} from '../../public/route_schema';
+import type {Trace} from '../../public/trace';
 import {Button, ButtonVariant} from '../../widgets/button';
 import {closeModal, showModal} from '../../widgets/modal';
 import {Stack} from '../../widgets/stack';
@@ -26,10 +28,13 @@ import {
   type AuthenticationResponse,
   type GoogleDriveConfig,
   type OpenFileResult,
+  type UploadResult,
 } from './gdrive_client';
 import {errResult} from '../../base/result';
 import {getErrorMessage} from '../../base/errors';
 import {Intent} from '../../widgets/common';
+import {ShareForm, type ShareState, type UploadState} from './share_form';
+import './styles.scss';
 
 // The Google Drive credentials are not checked into the repo. They are fetched
 // at runtime as a JSON blob from a public GCS bucket (which has CORS enabled).
@@ -92,9 +97,35 @@ async function initGDrive(): Promise<GoogleDriveClient | undefined> {
 // Google Drive as an "Open with" app, with a redirect URI such as
 // https://perfetto.dev/?state={...} where the JSON blob names the file to open.
 
+// What this plugin attaches to a trace it opens from Drive, through the
+// pluginArgs of openTraceFromBuffer(), and reads back in onTraceLoad(). It
+// travels with that one trace, so it cannot end up on a different one.
+//
+// A trace handed to the UI by another site (via postMessage) can carry plugin
+// args too, so what arrives is validated like any other untrusted input.
+const TRACE_ARGS_SCHEMA = z.object({
+  // The Drive file ID the trace was opened from.
+  fileId: z.string().refine(isValidDriveId),
+});
+
 export default class GoogleDrivePlugin implements PerfettoPlugin {
   static readonly id = 'dev.perfetto.GoogleDrive';
-  static readonly description = 'Open traces from Google Drive';
+  static readonly description = 'Open and save traces to Google Drive';
+
+  // What the "Share to Google Drive" dialog shows for this trace. It lives
+  // here, on the per-trace plugin instance, rather than in the dialog, so that
+  // an upload carries on being shown, cancellable and able to report failure
+  // if the dialog is closed and reopened.
+  private readonly share: ShareState = {
+    fileName: '',
+    location: 'root',
+    fileId: undefined,
+    upload: undefined,
+    error: undefined,
+  };
+
+  // The client, once initGDrive() has succeeded. Stays undefined if it fails.
+  static client: GoogleDriveClient | undefined;
 
   // Development aids for manually testing the failure handling UI. See
   // README.md in this directory. Registered in onActivate().
@@ -112,7 +143,7 @@ export default class GoogleDrivePlugin implements PerfettoPlugin {
     return app.isInternalUser || GoogleDrivePlugin.allowExternalUsersFlag.get();
   }
 
-  static onActivate(app: App) {
+  static onActivate(app: App, pluginArgs: RouteArgs) {
     GoogleDrivePlugin.allowExternalUsersFlag = app.featureFlags.register({
       id: 'dev.perfetto.GoogleDriveAllowExternalUsers',
       name: 'Google Drive for external users',
@@ -132,19 +163,17 @@ export default class GoogleDrivePlugin implements PerfettoPlugin {
     });
     GoogleDrivePlugin.mockDownloadFailureFlag = app.featureFlags.register({
       id: 'dev.perfetto.GoogleDriveMockDownloadFailure',
-      name: 'Development: Google Drive mock download failure',
+      name: 'Development: Google Drive mock download/upload failure',
       description:
-        'Makes every Google Drive file download fail, to test the error ' +
-        'handling UI.',
+        'Makes every Google Drive file download and upload fail, to test ' +
+        'the error handling UI.',
       defaultValue: false,
       devOnly: true,
     });
 
-    // Set once initGDrive() has succeeded. Stays undefined if it fails.
-    let client: GoogleDriveClient | undefined;
     const clientPromise = initGDrive();
     clientPromise.then((c) => {
-      client = c;
+      GoogleDrivePlugin.client = c;
       app.raf.scheduleFullRedraw();
     });
 
@@ -159,8 +188,10 @@ export default class GoogleDrivePlugin implements PerfettoPlugin {
       // and only once everything it needs has loaded. This is a callback as
       // both are only resolved some time after startup.
       visible: () =>
-        GoogleDrivePlugin.isUserAllowed(app) && client !== undefined,
+        GoogleDrivePlugin.isUserAllowed(app) &&
+        GoogleDrivePlugin.client !== undefined,
       action: async () => {
+        const client = GoogleDrivePlugin.client;
         if (client === undefined) return;
         await pickAndOpenGDriveTrace(app, client);
       },
@@ -174,6 +205,201 @@ export default class GoogleDrivePlugin implements PerfettoPlugin {
     if (state !== undefined && typeof state === 'string') {
       handleOpenWithState(app, clientPromise, state);
     }
+
+    // ?openFileId= share links, generated by the ShareForm.
+    const openFileId = pluginArgs['openFileId'];
+
+    if (openFileId !== undefined && typeof openFileId === 'string') {
+      handleOpenFileId(app, clientPromise, openFileId);
+    }
+  }
+
+  async onTraceLoad(
+    trace: Trace,
+    args?: {[key: string]: unknown},
+  ): Promise<void> {
+    const share = this.share;
+    share.fileName = trace.traceInfo.traceTitle;
+    const traceArgs = TRACE_ARGS_SCHEMA.safeParse(args);
+    if (traceArgs.success) {
+      // The trace was opened from Drive, so it is already there.
+      share.fileId = traceArgs.data.fileId;
+    }
+
+    // Stop an upload that is still running when the trace is closed. Nothing
+    // could show or cancel it any more, and it would keep the trace's contents
+    // alive until it finished.
+    trace.trash.defer(() => share.upload?.controller.abort());
+
+    // The button reflects the share state, so that an upload can be followed,
+    // and its outcome seen, while the dialog is closed. These callbacks run on
+    // every render, and the upload's progress reports trigger a redraw.
+    trace.sidebar.addMenuItem({
+      section: 'current_trace',
+      text: () =>
+        isSavedToDrive(share) ? 'Saved to GDrive' : 'Share to GDrive',
+      icon: () => {
+        if (share.upload !== undefined) return 'add_to_drive';
+        if (isSavedToDrive(share)) return 'cloud_done';
+        // The last action in the share dialog failed.
+        if (share.error !== undefined) return 'error';
+        return 'add_to_drive';
+      },
+      sortOrder: 10,
+      // While uploading, the badge shows how far the upload has got.
+      badge: () => {
+        const upload = share.upload;
+        if (upload === undefined) return 'preview';
+        if (upload.totalBytes === 0) return '…';
+        return `${Math.floor((100 * upload.uploadedBytes) / upload.totalBytes)}%`;
+      },
+      // Only for allowed users (see isUserAllowed()), only once everything has
+      // loaded, and only for traces whose contents can be read back to upload
+      // (not, for example, one loaded over HTTP+RPC).
+      visible: () =>
+        GoogleDrivePlugin.isUserAllowed(trace) &&
+        GoogleDrivePlugin.client !== undefined &&
+        trace.traceInfo.downloadable,
+      action: () => {
+        const client = GoogleDrivePlugin.client;
+        if (client === undefined) return;
+        // This button opens a modal dialog which displays the state of the file
+        // in google drive allowing the user to upload it and optionally share
+        // it. The dialog renders this.share, and keeps no state of its own.
+        showModal({
+          key: 'GDriveUpload',
+          title: 'Share to Google Drive',
+          icon: 'cloud_upload',
+          content: () =>
+            m(ShareForm, {
+              state: share,
+              onFileNameChange: (fileName: string) => {
+                share.fileName = fileName;
+              },
+              onUpload: () => void this.upload(trace, client),
+              onCancelUpload: () => share.upload?.controller.abort(),
+              onPickFolder: () => void this.pickFolder(client),
+              onOpenSharingDialog: () => void this.openSharingDialog(client),
+            }),
+        });
+      },
+    });
+  }
+
+  // Runs an action started from the share dialog. A failure is recorded in
+  // this.share.error, which the dialog shows in a banner, rather than being
+  // allowed to escape. The action reports failure by throwing an Error with a
+  // message for the user.
+  private async runShareAction(action: () => Promise<void>): Promise<void> {
+    this.share.error = undefined;
+    try {
+      await action();
+    } catch (e) {
+      console.error('Google Drive share action failed', e);
+      this.share.error = getErrorMessage(e);
+    } finally {
+      // These actions finish outside of any DOM event handler.
+      m.redraw();
+    }
+  }
+
+  // Uploads the trace to Drive. Progress and the outcome are recorded in
+  // this.share, so they are shown whenever the dialog is open.
+  private async upload(trace: Trace, client: GoogleDriveClient): Promise<void> {
+    const share = this.share;
+    if (share.fileName === '' || share.upload !== undefined) return;
+
+    // Fix the name and destination now: the upload outlives this click.
+    const fileName = share.fileName;
+    const parentId = share.location === 'root' ? 'root' : share.location.id;
+    const upload: UploadState = {
+      controller: new AbortController(),
+      uploadedBytes: 0,
+      totalBytes: 0,
+    };
+    const signal = upload.controller.signal;
+    share.upload = upload;
+
+    await this.runShareAction(async () => {
+      const accessToken = await authenticateForShare(client);
+      // The user may have cancelled while the sign-in popup was open.
+      if (signal.aborted) return;
+      let traceBlob: Blob;
+      try {
+        traceBlob = await trace.getTraceFile();
+      } catch (e) {
+        console.error('Failed to read the trace for upload', e);
+        throw new Error(
+          'This trace cannot be uploaded, as its contents are not available.',
+        );
+      }
+      const result: UploadResult =
+        GoogleDrivePlugin.mockDownloadFailureFlag.get()
+          ? {
+              ...errResult(
+                'Mock failure (Google Drive mock download/upload failure ' +
+                  'flag)',
+              ),
+              cancelled: false,
+            }
+          : await client.uploadFile(
+              accessToken,
+              traceBlob,
+              parentId,
+              fileName,
+              {
+                signal,
+                onProgress: (uploadedBytes, totalBytes) => {
+                  upload.uploadedBytes = uploadedBytes;
+                  upload.totalBytes = totalBytes;
+                  m.redraw();
+                },
+              },
+            );
+      if (!result.ok) {
+        // Cancelling is the user's choice, not a failure.
+        if (result.cancelled) return;
+        throw new Error(
+          `Couldn't upload the trace to Google Drive: ${result.error}`,
+        );
+      }
+      share.fileId = result.value;
+    });
+
+    share.upload = undefined;
+    m.redraw();
+  }
+
+  // Lets the user choose which Drive folder to upload to.
+  private async pickFolder(client: GoogleDriveClient): Promise<void> {
+    await this.runShareAction(async () => {
+      const accessToken = await authenticateForShare(client);
+      let newLocation: google.picker.DocumentObject | undefined;
+      try {
+        newLocation = await client.pickFolder(accessToken);
+      } catch (e) {
+        console.error('Failed to open the folder picker', e);
+        throw new Error("Couldn't open the Google Drive folder picker.");
+      }
+      if (newLocation !== undefined) {
+        this.share.location = newLocation;
+      }
+    });
+  }
+
+  // Opens Drive's sharing settings for the uploaded file.
+  private async openSharingDialog(client: GoogleDriveClient): Promise<void> {
+    const fileId = this.share.fileId;
+    if (fileId === undefined || fileId === '') return;
+    await this.runShareAction(async () => {
+      const accessToken = await authenticateForShare(client);
+      try {
+        client.openSharingDialog(accessToken, fileId);
+      } catch (e) {
+        console.error('Failed to open the sharing dialog', e);
+        throw new Error("Couldn't open the Google Drive sharing dialog.");
+      }
+    });
   }
 }
 
@@ -227,9 +453,53 @@ async function openGDriveTrace(
       // ACL-protected Drive traces must not be re-uploaded to the public
       // perfetto-ui-data GCS bucket via permalinks or crash reports.
       shareable: false,
+      // Lets onTraceLoad() know which Drive file this trace is.
+      pluginArgs: {[GoogleDrivePlugin.id]: {fileId}},
     });
   }
   return fileResult;
+}
+
+// Whether the trace is known to be in Drive, either uploaded or opened from
+// there.
+function isSavedToDrive(share: Readonly<ShareState>): boolean {
+  return share.fileId !== undefined && share.fileId !== '';
+}
+
+// Signs in for an action started from the "Share to Google Drive" dialog,
+// returning the access token. Unlike authenticateOrPrompt() this shows no
+// dialog of its own, as that would replace the share dialog: it throws an
+// Error with a message for the user instead, which the share dialog shows in
+// a banner. The user retries by pressing the same button again, which is a
+// click, so the sign-in popup is allowed.
+//
+// Nothing is awaited before client.authenticate() is called, so that the popup
+// is still attributed to the click that started the action.
+async function authenticateForShare(
+  client: GoogleDriveClient,
+): Promise<string> {
+  let auth: AuthenticationResponse;
+  try {
+    if (GoogleDrivePlugin.mockAuthFailureFlag.get()) {
+      throw new Error('Mock failure (Google Drive mock sign-in failure flag)');
+    }
+    auth = await client.authenticate();
+  } catch (e) {
+    throw new Error(`Signing in to Google Drive failed: ${getErrorMessage(e)}`);
+  }
+  switch (auth.response) {
+    case 'success':
+      return auth.accessToken;
+    case 'popup_blocked':
+      throw new Error(
+        'The Google sign-in window was blocked. Allow pop-ups for this site ' +
+          'and try again.',
+      );
+    case 'popup_closed':
+      throw new Error(
+        'The Google sign-in window was closed before sign-in completed.',
+      );
+  }
 }
 
 // Sidebar flow: authenticate, let the user pick a file, then open it.
@@ -446,15 +716,7 @@ async function handleOpenWithState(
 
   const client = await clientPromise;
   if (client === undefined) {
-    showModal({
-      key: 'GoogleDriveUnavailable',
-      title: 'Google Drive unavailable',
-      content: m(
-        'p',
-        'Opening traces from Google Drive is not available right now.',
-      ),
-      buttons: [{text: 'OK', primary: true}],
-    });
+    showUnavailableModal();
     return;
   }
 
@@ -467,4 +729,36 @@ async function handleOpenWithState(
   history.replaceState(null, '', url.toString());
 
   await openGDriveTraceWithAuth(app, client, fileId, resourceKey);
+}
+
+// Handles the ?openFileId= share link generated by the ShareForm.
+async function handleOpenFileId(
+  app: App,
+  clientPromise: Promise<GoogleDriveClient | undefined>,
+  fileId: string,
+) {
+  // Like a malformed ?state=, ignore an ID that cannot be a Drive file ID
+  // rather than asking the user to sign in for it.
+  if (!isValidDriveId(fileId)) return;
+
+  const client = await clientPromise;
+  if (client === undefined) {
+    showUnavailableModal();
+    return;
+  }
+  await openGDriveTraceWithAuth(app, client, fileId);
+}
+
+// Shown when a link asks for a Drive file but Google Drive support could not
+// be initialized.
+function showUnavailableModal() {
+  showModal({
+    key: 'GoogleDriveUnavailable',
+    title: 'Google Drive unavailable',
+    content: m(
+      'p',
+      'Opening traces from Google Drive is not available right now.',
+    ),
+    buttons: [{text: 'OK', primary: true}],
+  });
 }

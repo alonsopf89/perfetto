@@ -2,7 +2,8 @@
 
 Opens traces from Google Drive, either through the "Open from GDrive" sidebar
 button (file picker) or through Drive's "Open with" deep link
-(`?state=<json>`).
+(`?state=<json>`), and uploads the current trace to Google Drive through the
+"Share to GDrive" sidebar button.
 
 ## Manual testing
 
@@ -19,6 +20,18 @@ Happy paths:
 - [ ] ["Open with" deep link](#open-with-deep-link)
 - [ ] [Resource key](#resource-key)
 - [ ] [Drive traces are not shareable](#drive-traces-are-not-shareable)
+
+Sharing:
+
+- [ ] [Upload the current trace](#upload-the-current-trace)
+- [ ] [Cancel an upload](#cancel-an-upload)
+- [ ] [Sidebar button state](#sidebar-button-state)
+- [ ] [Close the dialog while uploading](#close-the-dialog-while-uploading)
+- [ ] [Close the trace while uploading](#close-the-trace-while-uploading)
+- [ ] [Choose a folder](#choose-a-folder)
+- [ ] [After uploading](#after-uploading)
+- [ ] [Share link](#share-link)
+- [ ] [Sharing failures](#sharing-failures)
 
 Button visibility:
 
@@ -177,7 +190,7 @@ On every page load the plugin loads, in order:
 1. the config (API key and client IDs), from
    `https://storage.googleapis.com/perfetto-misc/gdrive_config.json`,
 2. Google's API loader script, from `https://apis.google.com/js/api.js`,
-3. the picker module, also from `apis.google.com`,
+3. the picker and sharing dialog modules, also from `apis.google.com`,
 4. Google's sign-in library, from `https://accounts.google.com/gsi/client`.
 
 None of this opens a popup. If any step fails, the failure is logged to the
@@ -281,9 +294,11 @@ Each of these should be ignored silently: no dialog, no sign-in, and the
 ### Download failures
 
 To make every download fail, open `http://localhost:10000/#!/flags` and enable
-"Development: Google Drive mock download failure". Sign-in and the picker
+"Development: Google Drive mock download/upload failure". Sign-in and the picker
 still work normally; only the download itself fails. The flag is only listed
 on localhost. Turn it off afterwards.
+
+The same flag makes uploads from the "Share to Google Drive" dialog fail.
 
 A failed download shows a "Couldn't open file from Google Drive" dialog with
 an "OK" button and no retry. The underlying error is logged to the console.
@@ -316,3 +331,141 @@ logged to the console.
 
 There is no reliable way to provoke this by hand. The picker's code is loaded
 during initialisation, so blocking requests afterwards does not trigger it.
+
+### Upload the current trace
+
+The "Share to GDrive" button is in the sidebar's current trace section. It
+follows the same rules as "Open from GDrive", see
+[Button visibility](#button-visibility). It is also hidden for traces
+whose contents cannot be read back to upload, such as one loaded from
+`trace_processor_shell --httpd`.
+
+1. Open a trace from a local file.
+2. Click "Share to GDrive". The "Share to Google Drive" dialog should open
+   with the file name filled in and focused, and "My Drive" as the location.
+3. Clear the file name: "Upload" should be disabled and the field outlined in
+   red. Type a name again.
+4. Click "Upload" (or press Enter). Sign in if the Google popup asks. While
+   it uploads, the button should show a spinner and the text beside the
+   buttons should count up, e.g. "Uploading… 42% (12.3 of 29.4 MB)". Use a large trace or DevTools Network
+   throttling to make this last long enough to see.
+5. The dialog should switch to "Saved to Google Drive", and the file should
+   appear in Drive under that name.
+6. Repeat with a large trace (hundreds of MB). The upload is sent as a single
+   request rather than with Drive's resumable upload; this has been seen to
+   work with a 600 MB trace.
+
+### Cancel an upload
+
+1. Start an upload that takes a while (large trace or DevTools Network
+   throttling).
+2. Click "Cancel", which only appears while uploading. The upload should
+   stop, the form should return to normal with no error banner, and no file
+   should appear in Drive.
+3. Click "Upload" again: it should start a fresh upload.
+4. Click "Upload" and then "Cancel" while the Google sign-in popup is still
+   open, then finish signing in: nothing should be uploaded.
+
+### Sidebar button state
+
+The "Share to GDrive" button reflects what is happening, so an upload can be
+followed with the dialog closed. Clicking it always opens the dialog.
+
+| State | Text | Icon | Badge |
+|---|---|---|---|
+| Not uploaded | Share to GDrive | `add_to_drive` | preview |
+| Uploading | Share to GDrive | `add_to_drive` | `…`, then a percentage |
+| In Drive | Saved to GDrive | `cloud_done` | preview |
+| Last action in the dialog failed | Share to GDrive | `error` | preview |
+
+1. Start an upload that takes a while and close the dialog. The badge should
+   count up.
+2. When it finishes, the button should change to "Saved to GDrive" with the
+   `cloud_done` icon.
+3. Make an upload fail (mock download/upload failure flag). The icon should
+   change to `error`, and back once an upload succeeds.
+4. Open a trace from Drive: the button should show "Saved to GDrive" from the
+   start.
+
+### Close the dialog while uploading
+
+The dialog's state is kept with the trace, not with the dialog, so closing it
+does not stop or hide an upload.
+
+1. Start an upload that takes a while, then close the dialog (Escape, or its
+   close button).
+2. Reopen it with "Share to GDrive" while the upload is still running. It
+   should show the upload in progress, with the count still moving, the name
+   and location fields disabled, and "Cancel" working. It should not offer a
+   second "Upload".
+3. Close it again and wait for the upload to finish, then reopen it: it should
+   show "Saved to Google Drive".
+4. Repeat, but make the upload fail while the dialog is closed (go offline in
+   DevTools). Reopening it should show the red banner.
+5. Type a different file name, close the dialog without uploading, and reopen
+   it: the name you typed should still be there.
+
+### Close the trace while uploading
+
+1. Start an upload that takes a while, then open a different trace (or close
+   the current one).
+2. The upload should be cancelled: in the DevTools Network tab the upload
+   request should show as cancelled, and no file should appear in Drive.
+3. The newly opened trace should show as not uploaded, with no progress on its
+   "Share to GDrive" button.
+
+### Choose a folder
+
+1. In the dialog, click "Change". The Google folder picker should open.
+2. Pick a folder: the location field should show its name, and the upload
+   should go there.
+3. Click "Change" again and cancel the picker: the location should not change.
+4. Pick a folder inside a shared drive (under "Shared drives" in Drive, as
+   opposed to "My Drive") and upload: the file should appear there. Opening a
+   trace that lives in a shared drive should work too.
+
+### After uploading
+
+With the dialog showing "Saved to Google Drive":
+
+1. "Copy link" should copy a Perfetto link and briefly show "Copied".
+2. "Share" should open Google Drive's sharing dialog for the file.
+3. "Open in Drive" should open the file in Drive in a new tab.
+4. Close and reopen the dialog: it should still show the saved state.
+5. Open a trace from Drive (sidebar or deep link), then click "Share to
+   GDrive": it should show the saved state straight away, without uploading.
+
+### Share link
+
+"Copy link" produces a link of the form
+`<origin>#!/?dev.perfetto.GoogleDrive:openFileId=<FILE_ID>`.
+
+1. Paste it into a new tab. It should behave like the
+   ["Open with" deep link](#open-with-deep-link): sign in, then the trace
+   loads with its real name.
+2. Open it signed in as a different Google account that the file has been
+   shared with. The "Authorize access to file" dialog should appear, see
+   [File not yet authorised](#file-not-yet-authorised-authorize-access-to-file-dialog).
+3. With initialisation failing (see
+   [Initialisation fails](#initialisation-fails)), it should show the "Google
+   Drive unavailable" dialog.
+
+### Sharing failures
+
+Failures in the share dialog are shown in a red banner at the top of the
+dialog, not in a separate dialog, so the file name and location are kept. The
+banner clears when the next action starts, and the detail is logged to the
+console.
+
+- **Upload fails:** enable "Development: Google Drive mock download/upload
+  failure" and click "Upload". The banner should say the trace could not be
+  uploaded, and "Upload" should be usable again.
+- **Sign-in fails:** enable "Development: Google Drive mock sign-in failure"
+  and click "Upload", "Change" or "Share". The banner should say signing in
+  failed.
+- **Sign-in popup closed:** click "Upload" and close the Google popup. The
+  banner should say the window was closed. Clicking "Upload" again should
+  reopen the popup.
+- **Drive rejects the upload:** not easy to provoke. Going offline (DevTools
+  Network throttling) after signing in, then clicking "Upload", should show
+  the banner.

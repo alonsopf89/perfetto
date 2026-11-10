@@ -30,6 +30,13 @@ const GSI_CLIENT_URL = 'https://accounts.google.com/gsi/client';
 // The Drive REST API endpoint for files.
 const DRIVE_FILES_URL = 'https://www.googleapis.com/drive/v3/files';
 
+// The Drive REST API endpoint for uploading a file with its metadata.
+// supportsAllDrives lets the destination folder be in a shared drive; without
+// it Drive reports such a folder as not found.
+const DRIVE_UPLOAD_URL =
+  'https://www.googleapis.com/upload/drive/v3/files' +
+  '?uploadType=multipart&supportsAllDrives=true';
+
 // How long to wait for each network step of GoogleDriveClient.create() before
 // giving up. Without this a stalled request would never settle.
 const INIT_STEP_TIMEOUT_MS = 30000;
@@ -103,6 +110,45 @@ interface GoogleDriveFileMeta {
 
 const FILE_META_SCHEMA = z.object({name: z.string()});
 
+// What Drive returns for a successful upload: the new file's record.
+const UPLOAD_RESPONSE_SCHEMA = z.object({id: z.string()});
+
+export interface UploadOptions {
+  // Called as the upload progresses, with the bytes sent so far and the total
+  // to send. Both include a small amount of framing around the file itself.
+  readonly onProgress?: (uploadedBytes: number, totalBytes: number) => void;
+  // Abort this to cancel the upload.
+  readonly signal?: AbortSignal;
+}
+
+export interface UploadError extends ErrorResult {
+  // True if the upload was cancelled through UploadOptions.signal.
+  readonly cancelled: boolean;
+}
+
+// The ID of the uploaded file, or why it could not be uploaded.
+export type UploadResult = OkResult<string> | UploadError;
+
+// The body of an error response from the Drive API.
+const DRIVE_ERROR_SCHEMA = z.object({error: z.object({message: z.string()})});
+
+// Extracts Drive's explanation from the body of an error response, if it has
+// one.
+function driveErrorMessage(responseText: string): string | undefined {
+  let json: unknown;
+  try {
+    json = JSON.parse(responseText);
+  } catch {
+    return undefined;
+  }
+  const result = DRIVE_ERROR_SCHEMA.safeParse(json);
+  return result.success ? result.data.error.message : undefined;
+}
+
+function uploadError(message: string, cancelled = false): UploadError {
+  return {...errResult(message), cancelled};
+}
+
 // The resource key (from the "Open with" state payload) is required to access
 // some link-shared files the user has not opened before. Drive expects it in
 // the X-Goog-Drive-Resource-Keys header as "<fileId>/<resourceKey>".
@@ -152,8 +198,9 @@ export class GoogleDriveClient {
   private constructor(private readonly config: GoogleDriveConfig) {}
 
   // Loads everything the client needs and returns a ready-to-use client:
-  // Google's API loader and its picker module, for the file picker, and Google
-  // Identity Services, for signing in. Rejects if any step fails.
+  // Google's API loader with its picker and drive-share modules, for the file
+  // picker and the sharing dialog, and Google Identity Services, for signing
+  // in. Rejects if any step fails.
   //
   // Google's API client (gapi.client) is deliberately not loaded: Drive
   // requests are made with plain fetch() and the access token.
@@ -162,7 +209,7 @@ export class GoogleDriveClient {
   // startup. Only authenticate() opens a popup.
   static async create(config: GoogleDriveConfig): Promise<GoogleDriveClient> {
     await loadScript(GAPI_LOADER_URL);
-    await loadGapiModules('picker');
+    await loadGapiModules('picker:drive-share');
     await loadScript(GSI_CLIENT_URL);
     if (window.google?.accounts?.oauth2 === undefined) {
       throw new Error('Google Identity Services is not available');
@@ -194,6 +241,22 @@ export class GoogleDriveClient {
     );
     const pickerResult = await this.picker(token, {view});
     return pickerResult?.docs;
+  }
+
+  // Pick a folder using the Google Drive file picker.
+  async pickFolder(
+    token: string,
+  ): Promise<google.picker.DocumentObject | undefined> {
+    const view = new google.picker.DocsView(google.picker.ViewId.FOLDERS)
+      .setMode(google.picker.DocsViewMode.LIST)
+      .setIncludeFolders(true)
+      .setSelectFolderEnabled(true)
+      .setMimeTypes('application/vnd.google-apps.folder');
+    const pickerResult = await this.picker(token, {
+      view,
+      title: 'Select folder',
+    });
+    return pickerResult?.docs[0];
   }
 
   // Downloads a file's contents. Requires a prior successful authenticate().
@@ -229,6 +292,101 @@ export class GoogleDriveClient {
     } catch (error) {
       return openFileError(getErrorMessage(error));
     }
+  }
+
+  // Opens Drive's sharing settings dialog for a file. The drive-share module
+  // it needs is loaded by create().
+  openSharingDialog(token: string, fileId: string) {
+    const shareClient = new gapi.drive.share.ShareClient();
+    shareClient.setOAuthToken(token);
+    shareClient.setItemIds([fileId]);
+    shareClient.showSettingsDialog();
+  }
+
+  // Uploads a file to Drive, resolving with the new file's ID.
+  //
+  // This uses XMLHttpRequest rather than fetch(), as fetch() cannot report
+  // upload progress. `opts.onProgress` is called as bytes are sent, and
+  // aborting `opts.signal` cancels the upload.
+  uploadFile(
+    token: string,
+    traceBlob: Blob,
+    parentId: string,
+    fileName: string,
+    opts?: UploadOptions,
+  ): Promise<UploadResult> {
+    const metadata = {
+      name: fileName,
+      mimeType: 'application/octet-stream',
+      parents: [parentId],
+    };
+
+    const boundary = '-------314159265358979323846';
+    const delimiter = `\r\n--${boundary}\r\n`;
+    const closeDelim = `\r\n--${boundary}--`;
+
+    const metadataPart =
+      delimiter +
+      'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
+      JSON.stringify(metadata);
+
+    const mediaPart =
+      delimiter + 'Content-Type: application/octet-stream\r\n\r\n';
+
+    // The trace is referenced by the body rather than copied into it.
+    const body = new Blob([metadataPart, mediaPart, traceBlob, closeDelim]);
+
+    return new Promise<UploadResult>((resolve) => {
+      const signal = opts?.signal;
+      if (signal?.aborted) {
+        resolve(uploadError('Upload cancelled', true));
+        return;
+      }
+
+      const req = new XMLHttpRequest();
+      req.open('POST', DRIVE_UPLOAD_URL, /* async= */ true);
+      req.setRequestHeader(
+        'Content-Type',
+        `multipart/related; boundary=${boundary}`,
+      );
+      req.setRequestHeader('Authorization', `Bearer ${token}`);
+
+      req.upload.onprogress = (e: ProgressEvent) => {
+        opts?.onProgress?.(e.loaded, e.total);
+      };
+      req.onabort = () => resolve(uploadError('Upload cancelled', true));
+      req.onerror = () => resolve(uploadError('Network error'));
+      req.onload = () => {
+        if (req.status < 200 || req.status >= 300) {
+          // Drive explains the failure (e.g. storage quota exceeded) in the
+          // response body; pass that on if it is there.
+          const reason = driveErrorMessage(req.responseText);
+          resolve(
+            uploadError(
+              reason === undefined
+                ? `Google Drive returned HTTP ${req.status}`
+                : `${reason} (HTTP ${req.status})`,
+            ),
+          );
+          return;
+        }
+        let json: unknown;
+        try {
+          json = JSON.parse(req.responseText);
+        } catch {
+          json = undefined;
+        }
+        const result = UPLOAD_RESPONSE_SCHEMA.safeParse(json);
+        if (!result.success) {
+          resolve(uploadError('Google Drive did not return a file ID'));
+          return;
+        }
+        resolve(okResult(result.data.id));
+      };
+
+      signal?.addEventListener('abort', () => req.abort(), {once: true});
+      req.send(body);
+    });
   }
 
   // Fetches a file's metadata (currently just its name). Returns undefined if

@@ -196,6 +196,8 @@ function setupContentSecurityPolicy() {
       'https://accounts.google.com/',
       // Google Drive Picker dialog iframe.
       'https://docs.google.com',
+      // Google Drive Share settings dialog iframe (gapi.drive.share.ShareClient).
+      'https://drive.google.com',
     ],
   };
   const meta = document.createElement('meta');
